@@ -240,6 +240,18 @@ def AssertingInactiveArg : InactiveArgSpec {
   bit asserting = 1;
 }
 
+// Specify that the call writes one of its results through this pointer
+// argument, as sincos(x, &s, &c) does. The operand gives the type of the value
+// written, e.g. (OutputArg (TypeOf $x)).
+// The results of such a call are its return value, if not void, followed by
+// the values written through its OutputArgs, in argument order. The other
+// arguments' derivatives are written as for a call returning all of them
+// (with ArrayRet and DiffeRet), and Call<(SameFunc)> takes the other arguments
+// and returns the results in that form.
+class OutputArgSpec {
+}
+def OutputArg : OutputArgSpec;
+
 class GlobalExpr<bit uses_primal, bit uses_shadow, string val> : Operation<uses_primal, uses_shadow>{
   string value = val;
 }
@@ -621,6 +633,36 @@ def : CallPattern<(Op $x),
                   [ReadNone, NoUnwind]
                   >;
 
+// sin and cos written through pointers
+def : CallPattern<(Op $x, $s, $c),
+                  ["sincos", "sincosf", "sincosl", "__nv_sincos", "__nv_sincosf"],
+                  [
+                  (
+                   ArrayRet (FMul (ExtractValue<[1]> (Call<(SameFunc), [ReadNone,NoUnwind]> $x):$callset), (DiffeRet) ),
+                            (FNeg (FMul (ExtractValue<[0]> $callset), (DiffeRet) ) )
+                  ),
+                  (OutputArg (TypeOf $x)),
+                  (OutputArg (TypeOf $x))
+                  ],
+                  (ForwardFromSummedReverse),
+                  [WriteOnly, NoUnwind]
+                  >;
+
+// sin returned, cos written through a pointer
+def : CallPattern<(Op $x, $c),
+                  ["air.sincos.f16", "air.sincos.f32", "air.fast_sincos.f32",
+                   "__ocml_sincos_f16", "__ocml_sincos_f32", "__ocml_sincos_f64"],
+                  [
+                  (
+                   ArrayRet (FMul (ExtractValue<[1]> (Call<(SameFunc), [ReadNone,NoUnwind]> $x):$callset), (DiffeRet) ),
+                            (FNeg (FMul (ExtractValue<[0]> $callset), (DiffeRet) ) )
+                  ),
+                  (OutputArg (TypeOf $x))
+                  ],
+                  (ForwardFromSummedReverse),
+                  [WriteOnly, NoUnwind]
+                  >;
+
 def : CallPattern<(Op $x),
                   ["sincospi", "sincospif", "sincospil"],
                   [
@@ -631,6 +673,35 @@ def : CallPattern<(Op $x),
                   ],
                   (ForwardFromSummedReverse),
                   [ReadNone, NoUnwind]
+                  >;
+
+// sinpi and cospi written through pointers
+def : CallPattern<(Op $x, $s, $c),
+                  ["sincospi", "sincospif", "sincospil", "__nv_sincospi", "__nv_sincospif"],
+                  [
+                  (
+                   ArrayRet (FMul (ConstantFP<"3.14159265358979323846264338327950288"> $x), (FMul (ExtractValue<[1]> (Call<(SameFunc), [ReadNone,NoUnwind]> $x):$callset), (DiffeRet) ) ),
+                            (FMul (ConstantFP<"3.14159265358979323846264338327950288"> $x),  (FNeg (FMul (ExtractValue<[0]> $callset), (DiffeRet) ) ) )
+                  ),
+                  (OutputArg (TypeOf $x)),
+                  (OutputArg (TypeOf $x))
+                  ],
+                  (ForwardFromSummedReverse),
+                  [WriteOnly, NoUnwind]
+                  >;
+
+// sinpi returned, cospi written through a pointer
+def : CallPattern<(Op $x, $c),
+                  ["__ocml_sincospi_f16", "__ocml_sincospi_f32", "__ocml_sincospi_f64"],
+                  [
+                  (
+                   ArrayRet (FMul (ConstantFP<"3.14159265358979323846264338327950288"> $x), (FMul (ExtractValue<[1]> (Call<(SameFunc), [ReadNone,NoUnwind]> $x):$callset), (DiffeRet) ) ),
+                            (FMul (ConstantFP<"3.14159265358979323846264338327950288"> $x),  (FNeg (FMul (ExtractValue<[0]> $callset), (DiffeRet) ) ) )
+                  ),
+                  (OutputArg (TypeOf $x))
+                  ],
+                  (ForwardFromSummedReverse),
+                  [WriteOnly, NoUnwind]
                   >;
 
 def : CallPattern<(Op $x, $y),

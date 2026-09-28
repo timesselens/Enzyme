@@ -294,6 +294,25 @@ inline void emitBlasDeclUpdater(const RecordKeeper &RK, raw_ostream &os) {
                     "\"enzyme_inactive\"));\n";
             continue;
           }
+          // Tell type analysis what the call writes through an OutputArg: a
+          // value of the type of the argument named by (TypeOf $x).
+          if (Def->isSubClassOf("OutputArgSpec")) {
+            auto typeOf = dyn_cast<DagInit>(resultRoot->getArg(0));
+            int ord = -1;
+            if (typeOf && typeOf->getNumArgs() == 1 &&
+                typeOf->getOperator()->getAsString() == "TypeOf")
+              for (unsigned i = 0; i < tree->getNumArgs(); i++)
+                if (tree->getArgNameStr(i) == typeOf->getArgNameStr(0))
+                  ord = i;
+            if (ord < 0)
+              PrintFatalError(pattern->getLoc(),
+                              "OutputArg takes (TypeOf $x), with $x an "
+                              "argument of the pattern");
+            os << "    F.addParamAttr(" << argOpEn.index()
+               << ", llvm::Attribute::get(F.getContext(), \"enzyme_type\", "
+                  "TypeTree(ConcreteType(F.getFunctionType()->getParamType("
+               << ord << "))).Only(0, nullptr).Only(-1, nullptr).str()));\n";
+          }
         }
       }
       os << "  }\n";

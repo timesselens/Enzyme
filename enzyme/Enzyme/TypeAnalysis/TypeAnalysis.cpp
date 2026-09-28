@@ -184,7 +184,6 @@ const llvm::StringMap<llvm::Intrinsic::ID> LIBM_FUNCTIONS = {
     {"erfinv", Intrinsic::not_intrinsic},
 
     {"__fd_sincos_1", Intrinsic::not_intrinsic},
-    {"sincospi", Intrinsic::not_intrinsic},
     {"cmplx_inv", Intrinsic::not_intrinsic},
 
     // bessel functions
@@ -6064,8 +6063,13 @@ void TypeAnalyzer::visitCallBase(CallBase &call) {
               .Only(-1, &call),
           &call);
     }
+    // sincospi also names forms that write both results through pointers,
+    // so it isn't a memory-free libm function.
     if (funcName == "__fd_sincos_1" || funcName == "__fd_sincos_1f" ||
-        funcName == "__fd_sincos_1l") {
+        funcName == "__fd_sincos_1l" ||
+        ((funcName == "sincospi" || funcName == "sincospif" ||
+          funcName == "sincospil") &&
+         call.arg_size() == 1)) {
       updateAnalysis(call.getArgOperand(0),
                      TypeTree(ConcreteType(call.getArgOperand(0)->getType()))
                          .Only(-1, &call),

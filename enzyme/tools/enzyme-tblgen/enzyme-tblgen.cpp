@@ -162,6 +162,40 @@ void getIntrinsic(raw_ostream &os, StringRef intrName, const ListInit *typeInit,
   os << "}))";
 }
 
+// Whether this entry of a rule's ArgDerivatives is (OutputArg ...): the call
+// writes one of its results through that argument.
+static bool isOutputArg(const Init *argOp) {
+  if (auto resultRoot = dyn_cast<DagInit>(argOp))
+    return cast<DefInit>(resultRoot->getOperator())
+        ->getDef()
+        ->isSubClassOf("OutputArgSpec");
+  return false;
+}
+
+static bool hasOutputArgs(const Record *pattern) {
+  if (!pattern->getValue("ArgDerivatives"))
+    return false;
+  for (auto argOp : *pattern->getValueAsListInit("ArgDerivatives"))
+    if (isOutputArg(argOp))
+      return true;
+  return false;
+}
+
+// Emit asPtrTo(ptr, T): an OutputArg operand, or its shadow, as a pointer to
+// the T written through it. Julia passes a Ptr as an integer when LLVM uses
+// typed pointers (Julia 1.10 and 1.11).
+static void emitAsPtrTo(raw_ostream &os, StringRef indent) {
+  os << indent << "auto asPtrTo = [&](Value *ptr, Type *T) -> Value * {\n";
+  os << indent << "  if (!ptr->getType()->isPointerTy())\n";
+  os << indent
+     << "    return Builder2.CreateIntToPtr(ptr, getPointerType(T));\n";
+  os << indent << "  return Builder2.CreatePointerCast(\n";
+  os << indent
+     << "      ptr, getPointerType(T, "
+        "ptr->getType()->getPointerAddressSpace()));\n";
+  os << indent << "};\n";
+}
+
 raw_ostream &operator<<(raw_ostream &os, StringMap<std::string> &C) {
   os << "{";
   bool first = true;
@@ -398,8 +432,11 @@ bool handle(const Twine &curIndent, const Twine &argPattern, raw_ostream &os,
       } else {
         os << "({\n";
         os << curIndent << INDENT
-           << "Value *out = UndefValue::get(gutils->getShadowType(getSubType("
-           << origName << ".getType()";
+           << "Value *out = UndefValue::get(gutils->getShadowType(getSubType(";
+        if (hasOutputArgs(pattern))
+          os << "resultsTy";
+        else
+          os << origName << ".getType()";
         for (auto ind : retidx_cur) {
           os << ", " << ind;
         }
@@ -1115,6 +1152,86 @@ bool handle(const Twine &curIndent, const Twine &argPattern, raw_ostream &os,
                     Def->getValueInit("func"), origName);
       }
 
+      // In a rule with OutputArgs, Call<(SameFunc)> takes the other arguments:
+      // call the function with stack slots for its outputs, and return all of
+      // its results as one value. Memory attributes of the rule's call don't
+      // apply, since this call writes the slots.
+      bool sameFunc = false;
+      if (isCall)
+        if (auto func = dyn_cast<DagInit>(Def->getValueInit("func")))
+          sameFunc = func->getOperator()->getAsString() == "SameFunc" ||
+                     cast<DefInit>(func->getOperator())
+                         ->getDef()
+                         ->isSubClassOf("SameFunc");
+      if (sameFunc && hasOutputArgs(pattern)) {
+        if (anyVector)
+          PrintFatalError(pattern->getLoc(),
+                          "Call<(SameFunc)> in a rule with OutputArgs only "
+                          "takes primal values");
+        auto argOps = pattern->getValueAsListInit("ArgDerivatives");
+        size_t numInputs = 0;
+        for (auto argOp : *argOps)
+          if (!isOutputArg(argOp))
+            numInputs++;
+        if (vectorValued.size() != numInputs)
+          PrintFatalError(pattern->getLoc(),
+                          Twine("Call<(SameFunc)> in a rule with OutputArgs "
+                                "takes the ") +
+                              Twine(numInputs) +
+                              " arguments that are not "
+                              "OutputArgs");
+        os << curIndent << INDENT << "SmallVector<Value *, 3> args;\n";
+        os << curIndent << INDENT
+           << "SmallVector<std::pair<Value *, Type *>, 2> slots;\n";
+        size_t inputIdx = 0;
+        for (auto argOpEn : enumerate(*argOps)) {
+          if (!isOutputArg(argOpEn.value())) {
+            os << curIndent << INDENT << "args.push_back(" << argPattern << "_"
+               << inputIdx << ");\n";
+            inputIdx++;
+            continue;
+          }
+          os << curIndent << INDENT << "{\n";
+          os << curIndent << INDENT << INDENT << "Type *T = ";
+          handle(curIndent + INDENT + INDENT, argPattern + "_ty", os, pattern,
+                 cast<DagInit>(argOpEn.value())->getArg(0), builder,
+                 nameToOrdinal, lookup, retidx, origName, newFromOriginal,
+                 intrinsic);
+          os << ";\n";
+          os << curIndent << INDENT << INDENT
+             << "Value *slot = "
+                "IRBuilder<>(gutils->inversionAllocs).CreateAlloca(T);\n";
+          os << curIndent << INDENT << INDENT
+             << "slots.emplace_back(slot, T);\n";
+          os << curIndent << INDENT << INDENT << "Type *PT = FT->getParamType("
+             << argOpEn.index() << ");\n";
+          os << curIndent << INDENT << INDENT
+             << "args.push_back(PT->isIntegerTy() ? " << builder
+             << ".CreatePtrToInt(slot, PT) : " << builder
+             << ".CreatePointerBitCastOrAddrSpaceCast(slot, PT));\n";
+          os << curIndent << INDENT << "}\n";
+        }
+        os << curIndent << INDENT << "CallInst *V = " << builder
+           << ".CreateCall(FT, callval, args);\n";
+        os << curIndent << INDENT
+           << "V->setDebugLoc(gutils->getNewFromOriginal(" << origName
+           << ".getDebugLoc()));\n";
+        os << curIndent << INDENT << "V->setCallingConv(cconv);\n";
+        os << curIndent << INDENT
+           << "Value *res = UndefValue::get(resultsTy);\n";
+        os << curIndent << INDENT << "unsigned i = 0;\n";
+        os << curIndent << INDENT << "if (!V->getType()->isVoidTy())\n";
+        os << curIndent << INDENT << INDENT << "res = " << builder
+           << ".CreateInsertValue(res, V, {i++});\n";
+        os << curIndent << INDENT << "for (auto &slot : slots)\n";
+        os << curIndent << INDENT << INDENT << "res = " << builder
+           << ".CreateInsertValue(res, " << builder
+           << ".CreateLoad(slot.second, slot.first), {i++});\n";
+        os << curIndent << INDENT << "res;\n";
+        os << curIndent << "})";
+        return false;
+      }
+
       if (anyVector && intrinsic != MLIRDerivatives) {
         os << curIndent << INDENT << "Value *res = nullptr;\n";
         os << curIndent << INDENT
@@ -1538,6 +1655,10 @@ void printDiffUse(
 
   VariableSetting nameToOrdinal = parseVariables(tree, intrinsic, origName);
 
+  bool outputs = false;
+  for (auto argOp : *argOps)
+    outputs |= isOutputArg(argOp);
+
   for (auto argOpEn : enumerate(*argOps)) {
     size_t argIdx = argOpEn.index();
     if (auto resultRoot = dyn_cast<DagInit>(argOpEn.value())) {
@@ -1546,6 +1667,32 @@ void printDiffUse(
       if (opName == "InactiveArgSpec" || Def->isSubClassOf("InactiveArgSpec")) {
         continue;
       }
+    }
+
+    // The shadow of an OutputArg receives the results' tangents in forward
+    // mode, and holds their adjoints in reverse mode. With runtime activity,
+    // the reverse pass also compares the primal with the shadow. Split
+    // forward mode isn't implemented, so it needs neither.
+    if (isOutputArg(argOpEn.value())) {
+      os << prefix << "  // Arg " << argIdx << " : " << *argOpEn.value()
+         << "\n";
+      os << prefix
+         << "  if ((shadow || gutils->runtimeActivity) && mode != "
+            "DerivativeMode::ForwardModeSplit && "
+         << origName << "->getOperand(" << argIdx
+         << ") == val && !gutils->isConstantValue(" << origName
+         << "->getOperand(" << argIdx
+         << ")) && "
+            "!gutils->isConstantInstruction(const_cast<Instruction*>((const "
+            "Instruction*)"
+         << origName << "))) {\n";
+      os << prefix
+         << "    if (EnzymePrintDiffUse) llvm::errs() << \"Need \" << (shadow "
+            "? \"shadow\" : \"primal\") << \" of \" << *val << \" written by "
+            "\" << *user << \"\\n\";\n";
+      os << prefix << "    return true;\n";
+      os << prefix << "  }\n";
+      continue;
     }
 
     // The condition necessary to require the use of the arg
@@ -1584,7 +1731,7 @@ void printDiffUse(
            << "  if (!shadow && !gutils->isConstantValue(const_cast<Value*>("
            << origName << "->getOperand(" << argIdx << ")))";
 
-      if (foundDiffRet) {
+      if (foundDiffRet && !outputs) {
         if (intrinsic == MLIRDerivatives)
           os << " && !gutils->isConstantValue(" << origName
              << "->getResult(0))";
@@ -1595,7 +1742,9 @@ void printDiffUse(
         if (intrinsic == MLIRDerivatives)
           os << " && !gutils->isConstantInstruction(" << origName << ")";
         else
-          os << " && !gutils->isConstantInstruction(const_cast<Instruction*>( "
+          os << " && "
+                "!gutils->isConstantInstruction(const_cast<Instruction*>(("
+                "const Instruction*)"
              << origName << "))";
       }
 
@@ -1621,11 +1770,13 @@ void printDiffUse(
       os << prefix << "  if (shadow && !gutils->isConstantValue(" << origName
          << "->getOperand(" << argIdx << "))";
 
-      if (foundDiffRet) {
+      if (foundDiffRet && !outputs) {
         os << " && !gutils->isConstantValue(const_cast<Value*>((const Value*)"
            << origName << "))";
       } else {
-        os << " && !gutils->isConstantInstruction(const_cast<Instruction*>( "
+        os << " && "
+              "!gutils->isConstantInstruction(const_cast<Instruction*>((const "
+              "Instruction*)"
            << origName << "))";
       }
 
@@ -1761,9 +1912,83 @@ static void emitReverseCommon(raw_ostream &os, const Record *pattern,
                               StringRef origName, const ListInit *argOps) {
   auto nameToOrdinal = parseVariables(tree, intrinsic, origName);
 
+  bool outputs = hasOutputArgs(pattern);
+  if (outputs) {
+    // The adjoints of the call's results: its return value's, and those in the
+    // shadows of its OutputArgs, which the call overwrote and so are zeroed.
+    os << "        {\n";
+    emitAsPtrTo(os, "          ");
+    os << "          dif = "
+          "Constant::getNullValue(gutils->getShadowType(resultsTy));\n";
+    os << "          auto setResult = [&](unsigned i, Value *d) {\n";
+    os << "            if (gutils->getWidth() == 1) {\n";
+    os << "              dif = Builder2.CreateInsertValue(dif, d, {i});\n";
+    os << "              return;\n";
+    os << "            }\n";
+    os << "            for (unsigned idx = 0, W = gutils->getWidth(); idx < W; "
+          "idx++)\n";
+    os << "              dif = Builder2.CreateInsertValue(dif, "
+          "gutils->extractMeta(Builder2, d, idx), {idx, i});\n";
+    os << "          };\n";
+    os << "          unsigned resultIdx = 0;\n";
+    os << "          if (!" << origName << ".getType()->isVoidTy()) {\n";
+    os << "            if (!gutils->isConstantValue(&" << origName << ")) {\n";
+    os << "              setResult(resultIdx, diffe(&" << origName
+       << ", Builder2));\n";
+    os << "              setDiffe(&" << origName
+       << ", Constant::getNullValue(gutils->getShadowType(" << origName
+       << ".getType())), Builder2);\n";
+    os << "            }\n";
+    os << "            resultIdx++;\n";
+    os << "          }\n";
+    for (auto argOpEn : enumerate(*argOps)) {
+      if (!isOutputArg(argOpEn.value()))
+        continue;
+      auto arg =
+          (origName + ".getOperand(" + Twine(argOpEn.index()) + ")").str();
+      os << "          if (!gutils->isConstantValue(" << arg << ")) {\n";
+      os << "            Type *T = getSubType(resultsTy, resultIdx);\n";
+      os << "            Value *ptr = lookup(gutils->invertPointerM(" << arg
+         << ", Builder2), Builder2);\n";
+      // With runtime activity, an output whose shadow is its primal is
+      // inactive, and its memory is left as it is.
+      os << "            Value *active = nullptr;\n";
+      os << "            if (gutils->runtimeActivity) {\n";
+      os << "              auto base = getBaseObject(" << arg << ");\n";
+      os << "              if (!isa<AllocaInst>(base) &&\n";
+      os << "                  !isAllocationCall(base, gutils->TLI))\n";
+      os << "                active = Builder2.CreateICmpNE(\n";
+      os << "                    lookup(gutils->getNewFromOriginal(" << arg
+         << "), Builder2),\n";
+      os << "                    gutils->getWidth() == 1\n";
+      os << "                        ? ptr\n";
+      os << "                        : gutils->extractMeta(Builder2, ptr, "
+            "0));\n";
+      os << "            }\n";
+      os << "            auto rule = [&](Value *ptr) -> Value * {\n";
+      os << "              ptr = asPtrTo(ptr, T);\n";
+      os << "              Value *d = Builder2.CreateLoad(T, ptr);\n";
+      os << "              Value *zero = Constant::getNullValue(T);\n";
+      os << "              Builder2.CreateStore(\n";
+      os << "                  active ? Builder2.CreateSelect(active, zero, d) "
+            ": zero, ptr);\n";
+      os << "              return active ? Builder2.CreateSelect(active, d, "
+            "zero) : d;\n";
+      os << "            };\n";
+      os << "            setResult(resultIdx,\n";
+      os << "                      applyChainRule(T, Builder2, rule, ptr));\n";
+      os << "          }\n";
+      os << "          resultIdx++;\n";
+    }
+    os << "        }\n";
+  }
+
   bool seen = false;
   for (auto argOpEn : enumerate(*argOps)) {
     size_t argIdx = argOpEn.index();
+    // With OutputArgs, dif was gathered above.
+    if (outputs)
+      break;
     if (auto resultRoot = dyn_cast<DagInit>(argOpEn.value())) {
       auto opName = resultRoot->getOperator()->getAsString();
       auto Def = cast<DefInit>(resultRoot->getOperator())->getDef();
@@ -1924,6 +2149,8 @@ static void emitReverseCommon(raw_ostream &os, const Record *pattern,
         continue;
       }
     }
+    if (isOutputArg(argOpEn.value()))
+      continue;
 
     const char *curIndent = "        ";
     if (intrinsic == MLIRDerivatives)
@@ -2135,11 +2362,16 @@ static void emitDerivatives(const RecordKeeper &recordKeeper, raw_ostream &os,
       }
       origName = "call";
 #if LLVM_VERSION_MAJOR >= 14
-      os << ") && call.arg_size() == " << tree->getNumArgs() << " ){\n";
+      os << ") && call.arg_size() == " << tree->getNumArgs();
 #else
-      os << ") && call.getNumArgOperands() == " << tree->getNumArgs()
-         << " ){\n";
+      os << ") && call.getNumArgOperands() == " << tree->getNumArgs();
 #endif
+      for (auto argOpEn : enumerate(*argOps))
+        if (isOutputArg(argOpEn.value()))
+          os << " && (call.getArgOperand(" << argOpEn.index()
+             << ")->getType()->isPointerTy() || call.getArgOperand("
+             << argOpEn.index() << ")->getType()->isIntegerTy())";
+      os << " ){\n";
       break;
     }
     case IntrDerivatives: {
@@ -2258,6 +2490,11 @@ static void emitDerivatives(const RecordKeeper &recordKeeper, raw_ostream &os,
 
     VariableSetting nameToOrdinal = parseVariables(tree, intrinsic, origName);
 
+    bool outputs = hasOutputArgs(pattern);
+    if (outputs && intrinsic != CallDerivatives)
+      PrintFatalError(pattern->getLoc(),
+                      "OutputArg is only supported in a CallPattern");
+
     if (intrinsic != BinopDerivatives && intrinsic != InstDerivatives &&
         intrinsic != MLIRDerivatives) {
       os << "    if (gutils->knownRecomputeHeuristic.find(&" << origName
@@ -2270,6 +2507,25 @@ static void emitDerivatives(const RecordKeeper &recordKeeper, raw_ostream &os,
          << ", "
             "CacheType::Self, BuilderZ));\n";
       os << "        }\n";
+      os << "    }\n";
+    }
+
+    if (outputs) {
+      // Split forward mode isn't implemented for these rules. Say so while the
+      // call is still in place, rather than fail on a call that mode dropped.
+      os << "    if (Mode == DerivativeMode::ForwardModeSplit &&\n";
+      os << "        !(gutils->isConstantInstruction(&" << origName
+         << ") && gutils->isConstantValue(&" << origName << "))) {\n";
+      os << "      std::string s;\n";
+      os << "      llvm::raw_string_ostream ss(s);\n";
+      os << "      ss << \"split forward mode is not implemented for a call "
+            "\"\n";
+      os << "            \"writing results through pointers: \" << " << origName
+         << " << \"\\n\";\n";
+      os << "      EmitNoDerivativeError(ss.str(), " << origName
+         << ", gutils, BuilderZ);\n";
+      os << "      eraseIfUnused(" << origName << ");\n";
+      os << "      return true;\n";
       os << "    }\n";
     }
 
@@ -2289,6 +2545,34 @@ static void emitDerivatives(const RecordKeeper &recordKeeper, raw_ostream &os,
       else
         os << "      return;\n";
 
+      if (outputs) {
+        // The call's results: its return value, if not void, then the values
+        // it writes through its OutputArgs.
+        os << "    SmallVector<Type *, 2> resultTys;\n";
+        os << "    if (!" << origName << ".getType()->isVoidTy())\n";
+        os << "      resultTys.push_back(" << origName << ".getType());\n";
+        for (auto argOp : *argOps) {
+          if (!isOutputArg(argOp))
+            continue;
+          auto outputDag = cast<DagInit>(argOp);
+          if (outputDag->getNumArgs() != 1)
+            PrintFatalError(pattern->getLoc(),
+                            "OutputArg takes the type of the value written, "
+                            "e.g. (OutputArg (TypeOf $x))");
+          os << "    resultTys.push_back(";
+          handle("    ", "outputty", os, pattern, outputDag->getArg(0),
+                 "BuilderZ", nameToOrdinal, /*lookup*/ false, {}, origName,
+                 /*newFromOriginal*/ false, intrinsic);
+          os << ");\n";
+        }
+        os << "    Type *resultsTy = ArrayType::get(resultTys[0], "
+              "resultTys.size());\n";
+        os << "    for (auto T : resultTys)\n";
+        os << "      if (T != resultTys[0])\n";
+        os << "        resultsTy = StructType::get(" << origName
+           << ".getContext(), resultTys);\n";
+      }
+
       os << "    switch (Mode) {\n";
       os << "      case DerivativeMode::ForwardModeSplit:\n";
       os << "      case DerivativeMode::ForwardMode:{\n";
@@ -2305,6 +2589,9 @@ static void emitDerivatives(const RecordKeeper &recordKeeper, raw_ostream &os,
 
       if (intrinsic == MLIRDerivatives) {
         os << "     mlir::Value res = nullptr;\n";
+      } else if (outputs) {
+        os << "        Value *res = "
+              "Constant::getNullValue(gutils->getShadowType(resultsTy));\n";
       } else {
         os << "        Value *res = "
               "Constant::getNullValue(gutils->getShadowType("
@@ -2328,6 +2615,8 @@ static void emitDerivatives(const RecordKeeper &recordKeeper, raw_ostream &os,
             continue;
           }
         }
+        if (isOutputArg(argOpEn.value()))
+          continue;
 
         if (intrinsic == MLIRDerivatives) {
           os << curIndent << "if (!gutils->isConstantValue(" << origName
@@ -2339,8 +2628,13 @@ static void emitDerivatives(const RecordKeeper &recordKeeper, raw_ostream &os,
              << ".getOperand(" << argIdx << "))) {\n";
           os << curIndent << INDENT << "Value *dif = diffe(" << origName
              << ".getOperand(" << argIdx << "), Builder2);\n";
-          os << curIndent << INDENT
-             << "Value *arg_diff_tmp = UndefValue::get(res->getType());\n";
+          // With OutputArgs every result is stored, so results that this
+          // argument has no term for keep the sum so far, not undef.
+          if (outputs)
+            os << curIndent << INDENT << "Value *arg_diff_tmp = res;\n";
+          else
+            os << curIndent << INDENT
+               << "Value *arg_diff_tmp = UndefValue::get(res->getType());\n";
         }
 
         initializeNames(Twine(curIndent) + INDENT, os, argOpEn.value(), "local",
@@ -2445,16 +2739,80 @@ static void emitDerivatives(const RecordKeeper &recordKeeper, raw_ostream &os,
       os << "        gutils->setDiffe(" << origName
          << "->getResult(0), res, builder);\n";
       os << "        return success();\n";
+    } else if (outputs) {
+      // The tangents of the results go to the return value and to the
+      // shadows of the OutputArgs, overwritten as the call overwrote them.
+      emitAsPtrTo(os, "        ");
+      os << "        auto getResult = [&](unsigned i) -> Value * {\n";
+      os << "          if (gutils->getWidth() == 1)\n";
+      os << "            return gutils->extractMeta(Builder2, res, "
+            "ArrayRef<unsigned>({i}));\n";
+      os << "          Value *out = "
+            "UndefValue::get(gutils->getShadowType(getSubType(resultsTy, "
+            "i)));\n";
+      os << "          for (unsigned idx = 0, W = gutils->getWidth(); idx < W; "
+            "idx++)\n";
+      os << "            out = Builder2.CreateInsertValue(out, "
+            "gutils->extractMeta(Builder2, res, ArrayRef<unsigned>({idx, "
+            "i})), {idx});\n";
+      os << "          return out;\n";
+      os << "        };\n";
+      os << "        unsigned resultIdx = " << origName
+         << ".getType()->isVoidTy() ? 0 : 1;\n";
+      for (auto argOpEn : enumerate(*argOps)) {
+        if (!isOutputArg(argOpEn.value()))
+          continue;
+        auto arg =
+            (origName + ".getOperand(" + Twine(argOpEn.index()) + ")").str();
+        os << "        if (!gutils->isConstantValue(" << arg << ")) {\n";
+        os << "          Type *T = getSubType(resultsTy, resultIdx);\n";
+        os << "          Value *ptr = gutils->invertPointerM(" << arg
+           << ", Builder2);\n";
+        // With runtime activity, an output whose shadow is its primal keeps
+        // the primal result.
+        os << "          Value *active = nullptr;\n";
+        os << "          if (gutils->runtimeActivity) {\n";
+        os << "            auto base = getBaseObject(" << arg << ");\n";
+        os << "            if (!isa<AllocaInst>(base) &&\n";
+        os << "                !isAllocationCall(base, gutils->TLI))\n";
+        os << "              active = Builder2.CreateICmpNE(\n";
+        os << "                  gutils->getNewFromOriginal(" << arg << "),\n";
+        os << "                  gutils->getWidth() == 1\n";
+        os << "                      ? ptr\n";
+        os << "                      : gutils->extractMeta(Builder2, ptr, "
+              "0));\n";
+        os << "          }\n";
+        os << "          auto rule = [&](Value *ptr, Value *val) {\n";
+        os << "            ptr = asPtrTo(ptr, T);\n";
+        os << "            if (active)\n";
+        os << "              val = Builder2.CreateSelect(active, val,\n";
+        os << "                                          "
+              "Builder2.CreateLoad(T, ptr));\n";
+        os << "            Builder2.CreateStore(val, ptr);\n";
+        os << "          };\n";
+        os << "          applyChainRule(Builder2, rule, ptr, "
+              "getResult(resultIdx));\n";
+        os << "        }\n";
+        os << "        resultIdx++;\n";
+      }
+      // Last, as setDiffe replaces the placeholder that Builder2 may follow.
+      os << "        if (!" << origName
+         << ".getType()->isVoidTy() && !gutils->isConstantValue(&" << origName
+         << "))\n";
+      os << "          setDiffe(&" << origName
+         << ", getResult(0), Builder2);\n";
+      os << "        break;\n";
     } else {
       os << "        setDiffe(&" << origName << ", res, Builder2);\n";
       os << "        break;\n";
     }
     os << "      }\n";
 
-    // A rule with several results (ArrayRet). Error estimation applies the
-    // one-result formula to each result: the errors due to the arguments,
-    // relative to that result's value, and at least one ulp of it.
-    bool multi = false;
+    // A rule with several results: the call's own (ArrayRet), or those it
+    // writes through OutputArgs. Error estimation applies the one-result
+    // formula to each result: the errors due to the arguments, relative to
+    // that result's value, and at least one ulp of it.
+    bool multi = outputs;
     for (auto argOp : *argOps)
       if (auto dag = dyn_cast<DagInit>(argOp))
         if (cast<DefInit>(dag->getOperator())->getDef()->getName() ==
@@ -2464,21 +2822,42 @@ static void emitDerivatives(const RecordKeeper &recordKeeper, raw_ostream &os,
       os << "      case DerivativeMode::ForwardModeError: {\n";
       os << "        IRBuilder<> Builder2(&" << origName << ");\n";
       os << "        getForwardBuilder(Builder2);\n";
-      os << "        Type *errTy = " << origName << ".getType();\n";
+      if (outputs)
+        emitAsPtrTo(os, "        ");
+      os << "        Type *errTy = "
+         << (outputs ? std::string("resultsTy") : origName + ".getType()")
+         << ";\n";
       // The results as the program computed them.
       os << "        SmallVector<Value *, 3> primals;\n";
-      os << "        for (unsigned i = 0,\n";
-      os << "                      e = isa<StructType>(errTy)\n";
-      os << "                              ? errTy->getStructNumElements()\n";
-      os << "                              : errTy->getArrayNumElements();\n";
-      os << "             i < e; i++)\n";
-      os << "          "
-            "primals.push_back(Builder2.CreateExtractValue(newCall, "
-            "{i}));\n";
+      if (outputs) {
+        os << "        if (!" << origName << ".getType()->isVoidTy())\n";
+        os << "          primals.push_back(newCall);\n";
+        for (auto argOpEn : enumerate(*argOps)) {
+          if (!isOutputArg(argOpEn.value()))
+            continue;
+          os << "        {\n";
+          os << "          Type *T = getSubType(resultsTy, primals.size());\n";
+          os << "          primals.push_back(Builder2.CreateLoad(\n";
+          os << "              T, asPtrTo(newCall->getArgOperand("
+             << argOpEn.index() << "), T)));\n";
+          os << "        }\n";
+        }
+      } else {
+        os << "        for (unsigned i = 0,\n";
+        os << "                      e = isa<StructType>(errTy)\n";
+        os << "                              ? errTy->getStructNumElements()\n";
+        os << "                              : errTy->getArrayNumElements();\n";
+        os << "             i < e; i++)\n";
+        os << "          "
+              "primals.push_back(Builder2.CreateExtractValue(newCall, "
+              "{i}));\n";
+      }
       os << "        Value *res = Constant::getNullValue(errTy);\n";
       for (auto argOpEn : enumerate(*argOps)) {
         size_t argIdx = argOpEn.index();
         const char *curIndent = "        ";
+        if (isOutputArg(argOpEn.value()))
+          continue;
         if (auto resultRoot = dyn_cast<DagInit>(argOpEn.value())) {
           auto Def = cast<DefInit>(resultRoot->getOperator())->getDef();
           if (Def->isSubClassOf("InactiveArgSpec")) {
@@ -2565,7 +2944,31 @@ static void emitDerivatives(const RecordKeeper &recordKeeper, raw_ostream &os,
       os << "          res = Builder2.CreateInsertValue(res, e, {i});\n";
       emitErrorLog(os, origName, "r", "e");
       os << "        }\n";
-      os << "        setDiffe(&" << origName << ", res, Builder2);\n";
+      if (outputs) {
+        os << "        unsigned resultIdx = " << origName
+           << ".getType()->isVoidTy() ? 0 : 1;\n";
+        for (auto argOpEn : enumerate(*argOps)) {
+          if (!isOutputArg(argOpEn.value()))
+            continue;
+          auto arg =
+              (origName + ".getOperand(" + Twine(argOpEn.index()) + ")").str();
+          os << "        if (!gutils->isConstantValue(" << arg << "))\n";
+          os << "          Builder2.CreateStore(\n";
+          os << "              Builder2.CreateExtractValue(res, "
+                "{resultIdx}),\n";
+          os << "              asPtrTo(gutils->invertPointerM(" << arg
+             << ", Builder2),\n";
+          os << "                      getSubType(resultsTy, resultIdx)));\n";
+          os << "        resultIdx++;\n";
+        }
+        os << "        if (!" << origName
+           << ".getType()->isVoidTy() && !gutils->isConstantValue(&" << origName
+           << "))\n";
+        os << "          setDiffe(&" << origName
+           << ", Builder2.CreateExtractValue(res, {0}), Builder2);\n";
+      } else {
+        os << "        setDiffe(&" << origName << ", res, Builder2);\n";
+      }
       os << "        break;\n";
       os << "      }\n";
     }
@@ -3058,10 +3461,16 @@ void emitDiffUse(const RecordKeeper &recordKeeper, raw_ostream &os,
       }
       origName = "CI";
 #if LLVM_VERSION_MAJOR >= 14
-      os << ") && CI->arg_size() == " << tree->getNumArgs() << " ){\n";
+      os << ") && CI->arg_size() == " << tree->getNumArgs();
 #else
-      os << ") && CI->getNumArgOperands() == " << tree->getNumArgs() << " ){\n";
+      os << ") && CI->getNumArgOperands() == " << tree->getNumArgs();
 #endif
+      for (auto argOpEn : enumerate(*argOps))
+        if (isOutputArg(argOpEn.value()))
+          os << " && (CI->getArgOperand(" << argOpEn.index()
+             << ")->getType()->isPointerTy() || CI->getArgOperand("
+             << argOpEn.index() << ")->getType()->isIntegerTy())";
+      os << " ){\n";
       prefix = "  ";
       break;
     }
