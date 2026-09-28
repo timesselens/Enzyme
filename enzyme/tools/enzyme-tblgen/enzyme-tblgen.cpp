@@ -2534,6 +2534,35 @@ static void emitDerivatives(const RecordKeeper &recordKeeper, raw_ostream &os,
     else
       os << "    gutils->eraseIfUnused(" << origName << ");\n";
 
+    if (outputs) {
+      // The call stays, but where it only writes memory that isn't needed,
+      // that pointer is erased, as for any write-only argument. The call then
+      // writes a stack slot instead (the library still writes through it).
+      os << "    if (!unnecessaryInstructions.count(&" << origName << ")) {\n";
+      for (auto argOpEn : enumerate(*argOps)) {
+        if (!isOutputArg(argOpEn.value()))
+          continue;
+        auto idx = argOpEn.index();
+        os << "      if (unnecessaryValues.count(" << origName
+           << ".getArgOperand(" << idx << "))) {\n";
+        os << "        Type *T = ";
+        handle("        ", "slotty", os, pattern,
+               cast<DagInit>(argOpEn.value())->getArg(0), "BuilderZ",
+               nameToOrdinal, /*lookup*/ false, {}, origName,
+               /*newFromOriginal*/ false, intrinsic);
+        os << ";\n";
+        os << "        Value *slot = "
+              "IRBuilder<>(gutils->inversionAllocs).CreateAlloca(T);\n";
+        os << "        Type *PT = newCall->getArgOperand(" << idx
+           << ")->getType();\n";
+        os << "        newCall->setArgOperand(" << idx
+           << ", PT->isIntegerTy() ? BuilderZ.CreatePtrToInt(slot, PT) : "
+              "BuilderZ.CreatePointerBitCastOrAddrSpaceCast(slot, PT));\n";
+        os << "      }\n";
+      }
+      os << "    }\n";
+    }
+
     if (intrinsic == MLIRDerivatives) {
       os << "    if (gutils->isConstantInstruction(op))\n";
       os << "      return success();\n";

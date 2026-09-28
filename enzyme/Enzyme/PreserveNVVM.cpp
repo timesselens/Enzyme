@@ -1156,6 +1156,15 @@ bool preserveNVVM(bool Begin, Module &M,
         F.addFnAttr("enzyme_math", found->second.first);
         changed |= preserveLinkage(Begin, F);
       }
+    } else if (F.getName() == "__nv_sincos" || F.getName() == "__nv_sincosf" ||
+               F.getName() == "__nv_sincospi" ||
+               F.getName() == "__nv_sincospif") {
+      // These write their results through pointers and have rules of their
+      // own (OutputArg), so keep a linked-in definition out of line.
+      changed = true;
+      if (Begin) {
+        changed |= preserveLinkage(Begin, F);
+      }
     } else if (F.getName() == "_ZL21__internal_float2halffRjS_" ||
                F.getName() == "_ZL4hlog6__half" ||
                F.getName() == "_ZL6__hdiv6__halfS_" ||
