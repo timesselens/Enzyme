@@ -1954,6 +1954,109 @@ static void emitReverseCommon(raw_ostream &os, const Record *pattern,
     os << curIndent << "}\n";
   }
 }
+// Emit the optional call to enzymeLogError for a value of the original
+// instruction and its error (both expressions of the generated code).
+static void emitErrorLog(raw_ostream &os, StringRef origName,
+                         StringRef origValue, StringRef errValue) {
+  os << "        Function *logFunc = " << origName
+     << ".getModule()->getFunction(\"enzymeLogError\");\n";
+  os << "        if (logFunc) {\n"
+     << "            std::string moduleName = " << origName
+     << ".getModule()->getModuleIdentifier() ;\n"
+     << "            std::string functionName = " << origName
+     << ".getFunction()->getName().str();\n"
+     << "            std::string blockName = " << origName
+     << ".getParent()->getName().str();\n"
+     << "            int funcIdx = -1, blockIdx = -1, instIdx = -1;\n"
+     << "            auto funcIt = std::find_if(" << origName
+     << ".getModule()->begin(), " << origName
+     << ".getModule()->end(),\n"
+        "              [&](const auto& func) { return &func == "
+     << origName
+     << ".getFunction(); });\n"
+        "            if (funcIt != "
+     << origName
+     << ".getModule()->end()) {\n"
+        "              funcIdx = "
+        "std::distance("
+     << origName << ".getModule()->begin(), funcIt);\n"
+     << "            }\n"
+     << "            auto blockIt = std::find_if(" << origName
+     << ".getFunction()->begin(), " << origName
+     << ".getFunction()->end(),\n"
+        "              [&](const auto& block) { return &block == "
+     << origName
+     << ".getParent(); });\n"
+        "            if (blockIt != "
+     << origName
+     << ".getFunction()->end()) {\n"
+        "              blockIdx = std::distance("
+     << origName << ".getFunction()->begin(), blockIt);\n"
+     << "            }\n"
+     << "            auto instIt = std::find_if(" << origName
+     << ".getParent()->begin(), " << origName
+     << ".getParent()->end(),\n"
+        "              [&](const auto& curr) { return &curr == &"
+     << origName
+     << "; });\n"
+        "            if (instIt != "
+     << origName
+     << ".getParent()->end()) {\n"
+        "              instIdx = std::distance("
+     << origName << ".getParent()->begin(), instIt);\n"
+     << "            }\n"
+     << "            Value *origValue = "
+        "Builder2.CreateFPExt("
+     << origValue << ", Type::getDoubleTy(" << origName << ".getContext()));\n"
+     << "            Value *errValue = Builder2.CreateFPExt(" << errValue
+     << ", "
+        "Type::getDoubleTy("
+     << origName << ".getContext()));\n"
+     << "            std::string opcodeName = " << origName
+     << ".getOpcodeName();\n"
+     << "            std::string calleeName = \"<N/A>\";\n"
+     << "            if (auto CI = dyn_cast<CallInst>(&" << origName << ")) {\n"
+     << "                if (Function *fn = CI->getCalledFunction()) {\n"
+     << "                    calleeName = fn->getName();\n"
+     << "                } else {\n"
+     << "                    calleeName = \"<Unknown>\";\n"
+     << "                }\n"
+     << "            }\n"
+     << "#if LLVM_VERSION_MAJOR >= 17\n"
+     << "            Value *moduleNameValue = "
+        "Builder2.CreateGlobalString(moduleName);\n"
+     << "            Value *functionNameValue = "
+        "Builder2.CreateGlobalString(functionName + \" (\" +"
+        "std::to_string(funcIdx) + \")\");\n"
+     << "            Value *blockNameValue = "
+        "Builder2.CreateGlobalString(blockName + \" (\" +"
+        "std::to_string(blockIdx) + \")\");\n"
+     << "            Value *opcodeNameValue = "
+        "Builder2.CreateGlobalString(opcodeName + \" (\" "
+        "+std::to_string(instIdx) + \")\");\n"
+     << "            Value *calleeNameValue = "
+        "Builder2.CreateGlobalString(calleeName);\n"
+     << "#else\n"
+     << "            Value *moduleNameValue = "
+        "Builder2.CreateGlobalStringPtr(moduleName);\n"
+     << "            Value *functionNameValue = "
+        "Builder2.CreateGlobalStringPtr(functionName + \" (\" +"
+        "std::to_string(funcIdx) + \")\");\n"
+     << "            Value *blockNameValue = "
+        "Builder2.CreateGlobalStringPtr(blockName + \" (\" +"
+        "std::to_string(blockIdx) + \")\");\n"
+     << "            Value *opcodeNameValue = "
+        "Builder2.CreateGlobalStringPtr(opcodeName + \" (\" "
+        "+std::to_string(instIdx) + \")\");\n"
+     << "            Value *calleeNameValue = "
+        "Builder2.CreateGlobalStringPtr(calleeName);\n"
+     << "#endif\n"
+     << "            Builder2.CreateCall(logFunc, {origValue, "
+        "errValue, opcodeNameValue, calleeNameValue, moduleNameValue, "
+        "functionNameValue, blockNameValue});\n"
+     << "        }\n";
+}
+
 static void emitDerivatives(const RecordKeeper &recordKeeper, raw_ostream &os,
                             ActionType intrinsic) {
   emitSourceFileHeader("Rewriters", os);
@@ -2348,9 +2451,128 @@ static void emitDerivatives(const RecordKeeper &recordKeeper, raw_ostream &os,
     }
     os << "      }\n";
 
+    // A rule with several results (ArrayRet). Error estimation applies the
+    // one-result formula to each result: the errors due to the arguments,
+    // relative to that result's value, and at least one ulp of it.
+    bool multi = false;
+    for (auto argOp : *argOps)
+      if (auto dag = dyn_cast<DagInit>(argOp))
+        if (cast<DefInit>(dag->getOperator())->getDef()->getName() ==
+            "ArrayRet")
+          multi = true;
+    if (intrinsic != MLIRDerivatives && multi) {
+      os << "      case DerivativeMode::ForwardModeError: {\n";
+      os << "        IRBuilder<> Builder2(&" << origName << ");\n";
+      os << "        getForwardBuilder(Builder2);\n";
+      os << "        Type *errTy = " << origName << ".getType();\n";
+      // The results as the program computed them.
+      os << "        SmallVector<Value *, 3> primals;\n";
+      os << "        for (unsigned i = 0,\n";
+      os << "                      e = isa<StructType>(errTy)\n";
+      os << "                              ? errTy->getStructNumElements()\n";
+      os << "                              : errTy->getArrayNumElements();\n";
+      os << "             i < e; i++)\n";
+      os << "          "
+            "primals.push_back(Builder2.CreateExtractValue(newCall, "
+            "{i}));\n";
+      os << "        Value *res = Constant::getNullValue(errTy);\n";
+      for (auto argOpEn : enumerate(*argOps)) {
+        size_t argIdx = argOpEn.index();
+        const char *curIndent = "        ";
+        if (auto resultRoot = dyn_cast<DagInit>(argOpEn.value())) {
+          auto Def = cast<DefInit>(resultRoot->getOperator())->getDef();
+          if (Def->isSubClassOf("InactiveArgSpec")) {
+            if (Def->getValueAsBit("asserting"))
+              os << " assert(gutils->isConstantValue(" << origName
+                 << ".getOperand(" << argIdx << ")));\n";
+            continue;
+          }
+        }
+        os << curIndent << "if (!gutils->isConstantValue(" << origName
+           << ".getOperand(" << argIdx << "))) {\n";
+        // The argument's error times its value; each result divides by its
+        // own value below.
+        os << curIndent << INDENT << "Value *dif = Builder2.CreateFMul(diffe("
+           << origName << ".getOperand(" << argIdx
+           << "), Builder2), gutils->getNewFromOriginal(" << origName
+           << ".getOperand(" << argIdx << ")));\n";
+        os << curIndent << INDENT << "Value *arg_diff_tmp = res;\n";
+        initializeNames(Twine(curIndent) + INDENT, os, argOpEn.value(), "local",
+                        intrinsic);
+        std::function<void(ArrayRef<unsigned>, const Init *)> fwdres =
+            [&](ArrayRef<unsigned> idx, const Init *ival) {
+              if (auto resultTree = dyn_cast<DagInit>(ival)) {
+                auto Def = cast<DefInit>(resultTree->getOperator())->getDef();
+                if (Def->isSubClassOf("MultiReturn")) {
+                  unsigned i = 0;
+                  for (auto r : resultTree->getArgs()) {
+                    SmallVector<unsigned, 2> next(idx.begin(), idx.end());
+                    next.push_back(i);
+                    i++;
+                    fwdres(next, r);
+                  }
+                  return;
+                }
+                if (Def->isSubClassOf("InactiveArgSpec"))
+                  return;
+                os << curIndent << INDENT << "{\n";
+                os << curIndent << INDENT << INDENT << "Value *itmp = ";
+                ArrayRef<unsigned> retidx{};
+                bool vectorValued =
+                    handle(Twine(curIndent) + INDENT + INDENT, "fwdarg", os,
+                           pattern, resultTree, "Builder2", nameToOrdinal,
+                           /*lookup*/ false, retidx, origName,
+                           /*newFromOriginal*/ true, intrinsic);
+                os << ";\n";
+                (void)vectorValued;
+                assert(vectorValued);
+                os << curIndent << INDENT << INDENT
+                   << "itmp = Builder2.CreateIntrinsic(Intrinsic::fabs, "
+                      "ArrayRef<Type*>(itmp->getType()), "
+                      "ArrayRef<Value*>(itmp));\n";
+                os << curIndent << INDENT << INDENT
+                   << "arg_diff_tmp = GradientUtils::recursiveFAdd(Builder2, "
+                      "res, itmp, {";
+                bool seen = false;
+                for (auto i : idx) {
+                  if (seen)
+                    os << ", ";
+                  os << i;
+                  seen = true;
+                }
+                os << "}, {}, arg_diff_tmp, gutils->getWidth() != 1);\n";
+                os << curIndent << INDENT << "}\n";
+              } else
+                PrintFatalError(pattern->getLoc(),
+                                Twine("Unknown subinitialization"));
+            };
+        fwdres({}, argOpEn.value());
+        os << curIndent << INDENT << "res = arg_diff_tmp;\n";
+        os << curIndent << "}\n";
+      }
+      os << "        for (unsigned i = 0; i < primals.size(); i++) {\n";
+      os << "          Value *r = primals[i];\n";
+      // Only floating-point results have an error (logabsgamma's sign has
+      // none).
+      os << "          if (!r->getType()->isFPOrFPVectorTy())\n";
+      os << "            continue;\n";
+      os << "          Value *e = Builder2.CreateFDiv(\n";
+      os << "              Builder2.CreateExtractValue(res, {i}),\n";
+      os << "              Builder2.CreateIntrinsic(Intrinsic::fabs, "
+            "ArrayRef<Type *>(r->getType()),\n";
+      os << "                                       ArrayRef<Value *>(r)));\n";
+      os << "          e = Builder2.CreateMaxNum(get1ULP(Builder2, r), e);\n";
+      os << "          res = Builder2.CreateInsertValue(res, e, {i});\n";
+      emitErrorLog(os, origName, "r", "e");
+      os << "        }\n";
+      os << "        setDiffe(&" << origName << ", res, Builder2);\n";
+      os << "        break;\n";
+      os << "      }\n";
+    }
+
     // forward error TODO: `ForwardFromSummedReverse` behavior
     // also for custom derivatives.
-    if (intrinsic != MLIRDerivatives) {
+    if (intrinsic != MLIRDerivatives && !multi) {
       os << "      case DerivativeMode::ForwardModeError: {\n";
       os << "        IRBuilder<> Builder2(&" << origName << ");\n";
       os << "        getForwardBuilder(Builder2);\n";
@@ -2471,104 +2693,8 @@ static void emitDerivatives(const RecordKeeper &recordKeeper, raw_ostream &os,
       os << "        assert(res);\n";
 
       // Insert logging function call (optional)
-      os << "        Function *logFunc = " << origName
-         << ".getModule()->getFunction(\"enzymeLogError\");\n";
-      os << "        if (logFunc) {\n"
-         << "            std::string moduleName = " << origName
-         << ".getModule()->getModuleIdentifier() ;\n"
-         << "            std::string functionName = " << origName
-         << ".getFunction()->getName().str();\n"
-         << "            std::string blockName = " << origName
-         << ".getParent()->getName().str();\n"
-         << "            int funcIdx = -1, blockIdx = -1, instIdx = -1;\n"
-         << "            auto funcIt = std::find_if(" << origName
-         << ".getModule()->begin(), " << origName
-         << ".getModule()->end(),\n"
-            "              [&](const auto& func) { return &func == "
-         << origName
-         << ".getFunction(); });\n"
-            "            if (funcIt != "
-         << origName
-         << ".getModule()->end()) {\n"
-            "              funcIdx = "
-            "std::distance("
-         << origName << ".getModule()->begin(), funcIt);\n"
-         << "            }\n"
-         << "            auto blockIt = std::find_if(" << origName
-         << ".getFunction()->begin(), " << origName
-         << ".getFunction()->end(),\n"
-            "              [&](const auto& block) { return &block == "
-         << origName
-         << ".getParent(); });\n"
-            "            if (blockIt != "
-         << origName
-         << ".getFunction()->end()) {\n"
-            "              blockIdx = std::distance("
-         << origName << ".getFunction()->begin(), blockIt);\n"
-         << "            }\n"
-         << "            auto instIt = std::find_if(" << origName
-         << ".getParent()->begin(), " << origName
-         << ".getParent()->end(),\n"
-            "              [&](const auto& curr) { return &curr == &"
-         << origName
-         << "; });\n"
-            "            if (instIt != "
-         << origName
-         << ".getParent()->end()) {\n"
-            "              instIdx = std::distance("
-         << origName << ".getParent()->begin(), instIt);\n"
-         << "            }\n"
-         << "            Value *origValue = "
-            "Builder2.CreateFPExt(gutils->getNewFromOriginal(&"
-         << origName << "), Type::getDoubleTy(" << origName
-         << ".getContext()));\n"
-         << "            Value *errValue = Builder2.CreateFPExt(res, "
-            "Type::getDoubleTy("
-         << origName << ".getContext()));\n"
-         << "            std::string opcodeName = " << origName
-         << ".getOpcodeName();\n"
-         << "            std::string calleeName = \"<N/A>\";\n"
-         << "            if (auto CI = dyn_cast<CallInst>(&" << origName
-         << ")) {\n"
-         << "                if (Function *fn = CI->getCalledFunction()) {\n"
-         << "                    calleeName = fn->getName();\n"
-         << "                } else {\n"
-         << "                    calleeName = \"<Unknown>\";\n"
-         << "                }\n"
-         << "            }\n"
-         << "#if LLVM_VERSION_MAJOR >= 17\n"
-         << "            Value *moduleNameValue = "
-            "Builder2.CreateGlobalString(moduleName);\n"
-         << "            Value *functionNameValue = "
-            "Builder2.CreateGlobalString(functionName + \" (\" +"
-            "std::to_string(funcIdx) + \")\");\n"
-         << "            Value *blockNameValue = "
-            "Builder2.CreateGlobalString(blockName + \" (\" +"
-            "std::to_string(blockIdx) + \")\");\n"
-         << "            Value *opcodeNameValue = "
-            "Builder2.CreateGlobalString(opcodeName + \" (\" "
-            "+std::to_string(instIdx) + \")\");\n"
-         << "            Value *calleeNameValue = "
-            "Builder2.CreateGlobalString(calleeName);\n"
-         << "#else\n"
-         << "            Value *moduleNameValue = "
-            "Builder2.CreateGlobalStringPtr(moduleName);\n"
-         << "            Value *functionNameValue = "
-            "Builder2.CreateGlobalStringPtr(functionName + \" (\" +"
-            "std::to_string(funcIdx) + \")\");\n"
-         << "            Value *blockNameValue = "
-            "Builder2.CreateGlobalStringPtr(blockName + \" (\" +"
-            "std::to_string(blockIdx) + \")\");\n"
-         << "            Value *opcodeNameValue = "
-            "Builder2.CreateGlobalStringPtr(opcodeName + \" (\" "
-            "+std::to_string(instIdx) + \")\");\n"
-         << "            Value *calleeNameValue = "
-            "Builder2.CreateGlobalStringPtr(calleeName);\n"
-         << "#endif\n"
-         << "            Builder2.CreateCall(logFunc, {origValue, "
-            "errValue, opcodeNameValue, calleeNameValue, moduleNameValue, "
-            "functionNameValue, blockNameValue});\n"
-         << "        }\n";
+      emitErrorLog(os, origName,
+                   "gutils->getNewFromOriginal(&" + origName + ")", "res");
 
       os << "        setDiffe(&" << origName << ", res, Builder2);\n";
       os << "        break;\n";
