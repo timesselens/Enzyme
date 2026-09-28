@@ -4106,6 +4106,22 @@ void TypeAnalyzer::visitIntrinsicInst(llvm::IntrinsicInst &I) {
         &I);
     return;
 
+#if LLVM_VERSION_MAJOR >= 20
+  case Intrinsic::sincos:
+    // Both results, {sin, cos}, have the argument's type.
+    updateAnalysis(
+        &I,
+        TypeTree(ConcreteType(I.getOperand(0)->getType()->getScalarType()))
+            .Only(-1, &I),
+        &I);
+    updateAnalysis(
+        I.getOperand(0),
+        TypeTree(ConcreteType(I.getOperand(0)->getType()->getScalarType()))
+            .Only(-1, &I),
+        &I);
+    return;
+#endif
+
   case Intrinsic::fmuladd:
   case Intrinsic::fma:
     // No direction check as always valid

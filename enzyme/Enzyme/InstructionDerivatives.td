@@ -1031,6 +1031,18 @@ def : IntrPattern<(Op $x),
                   (ForwardFromSummedReverse)           
                   >;
 
+// LLVM's sincos intrinsic returns both results
+def : IntrPattern<(Op $x),
+                  [["sincos", "20", ""]],
+                  [
+                  (
+                   ArrayRet (FMul (ExtractValue<[1]> (Call<(SameFunc)> $x):$callset), (DiffeRet) ),
+                            (FNeg (FMul (ExtractValue<[0]> $callset), (DiffeRet) ) )
+                  )
+                  ],
+                  (ForwardFromSummedReverse)
+                  >;
+
 def : IntrPattern<(Op $x),
                   [["tan", "19", ""]],
                   [(FMul (DiffeRet), (FAdd (ConstantFP<"1.0"> $x), (FMul(Call<(SameFunc)> $x):$c, $c)))],
